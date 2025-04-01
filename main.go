@@ -85,6 +85,7 @@ func main() {
 	http.HandleFunc("/bucket", authMiddleware(bucketHandler))
 	http.HandleFunc("/bucket/edit", authMiddleware(bucketEditHandler))
 	http.HandleFunc("/bucket/delete", authMiddleware(bucketDeleteHandler))
+	http.HandleFunc("/bucket/view", authMiddleware(bucketViewHandler))
 
 	// Serve static files (if needed, e.g., custom CSS or JS).
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
@@ -422,6 +423,48 @@ func bucketHandler(w http.ResponseWriter, r *http.Request) {
 	templates.ExecuteTemplate(w, "bucket", data)
 }
 
+// bucketViewHandler displays the full data for a record in read-only mode.
+func bucketViewHandler(w http.ResponseWriter, r *http.Request) {
+	bucketName := r.URL.Query().Get("bucket")
+	keyHex := r.URL.Query().Get("key")
+	if bucketName == "" || keyHex == "" {
+		http.Error(w, "Bucket name and key are required", http.StatusBadRequest)
+		return
+	}
+	decodedKey, err := hex.DecodeString(keyHex)
+	if err != nil {
+		http.Error(w, "Invalid key format", http.StatusBadRequest)
+		return
+	}
+	var value string
+	err = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(bucketName))
+		if b == nil {
+			return fmt.Errorf("bucket %s not found", bucketName)
+		}
+		v := b.Get(decodedKey)
+		if v == nil {
+			return fmt.Errorf("key %s not found in bucket %s", keyHex, bucketName)
+		}
+		value = string(v)
+		return nil
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data := struct {
+		Bucket string
+		Key    string
+		Value  string
+	}{
+		Bucket: bucketName,
+		Key:    keyHex,
+		Value:  value,
+	}
+	templates.ExecuteTemplate(w, "view", data)
+}
+
 // bucketEditHandler handles showing the edit form (GET) and processing the update (POST).
 func bucketEditHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
@@ -702,6 +745,7 @@ const bucketTemplate = `
         <td>{{.value}}</td>
         <td>
           <a class="btn btn-sm btn-warning" href="/bucket/edit?bucket={{$.BucketName}}&key={{.key}}">Edit</a>
+          <a class="btn btn-sm btn-info" href="/bucket/view?bucket={{$.BucketName}}&key={{.key}}">View</a>
           <form method="post" action="/bucket/delete" style="display:inline-block;" onsubmit="return confirm('Delete key {{.key}}?');">
             <input type="hidden" name="bucket" value="{{$.BucketName}}">
             <input type="hidden" name="key" value="{{.key}}">
