@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -10,8 +12,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	bolt "go.etcd.io/bbolt"
+	"golang.org/x/crypto/bcrypt"
 )
 
 var (
@@ -19,7 +23,14 @@ var (
 	templates      *template.Template
 	bucketsPerPage = 10
 	recordsPerPage = 20
+	dbPath         string
+
+	// sessions stores session_token => username mapping (in-memory).
+	sessions     = make(map[string]string)
+	sessionMutex sync.Mutex
 )
+
+const sessionCookieName = "session_token"
 
 func main() {
 	// Get the user's home directory
@@ -28,7 +39,7 @@ func main() {
 		log.Fatalf("Failed to get home directory: %v", err)
 	}
 	// Construct the full path to your BoltDB file
-	dbPath := filepath.Join(homeDir, ".path", "db.db")
+	dbPath = filepath.Join(homeDir, ".path", "db.db")
 
 	// Open the BoltDB file
 	db, err = bolt.Open(dbPath, 0600, nil)
@@ -37,14 +48,42 @@ func main() {
 	}
 	defer db.Close()
 
+	// Initialize users bucket and default admin if not exists.
+	err = db.Update(func(tx *bolt.Tx) error {
+		usersBucket, err := tx.CreateBucketIfNotExists([]byte("users"))
+		if err != nil {
+			return err
+		}
+		// If "admin" doesn't exist, create it with default password "admin".
+		// IMPORTANT: For production, change the default password immediately.
+		if usersBucket.Get([]byte("admin")) == nil {
+			hash, err := bcrypt.GenerateFromPassword([]byte("admin"), bcrypt.DefaultCost)
+			if err != nil {
+				return err
+			}
+			log.Println("Default admin user created with password 'admin'. Change this immediately for production!")
+			return usersBucket.Put([]byte("admin"), hash)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("Error initializing users: %v", err)
+	}
+
 	// Parse embedded templates
 	initTemplates()
 
-	// Set up HTTP endpoints
-	http.HandleFunc("/", homeHandler)
-	http.HandleFunc("/bucket", bucketHandler)
-	http.HandleFunc("/bucket/edit", bucketEditHandler)
-	http.HandleFunc("/bucket/delete", bucketDeleteHandler)
+	// Set up HTTP endpoints (with authentication middleware applied to all protected routes)
+	http.HandleFunc("/login", loginHandler)
+	http.HandleFunc("/logout", authMiddleware(logoutHandler))
+	http.HandleFunc("/reset-password", authMiddleware(resetPasswordHandler))
+	http.HandleFunc("/export", authMiddleware(exportHandler))
+
+	// Protected endpoints:
+	http.HandleFunc("/", authMiddleware(homeHandler))
+	http.HandleFunc("/bucket", authMiddleware(bucketHandler))
+	http.HandleFunc("/bucket/edit", authMiddleware(bucketEditHandler))
+	http.HandleFunc("/bucket/delete", authMiddleware(bucketDeleteHandler))
 
 	// Serve static files (if needed, e.g., custom CSS or JS)
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
@@ -66,8 +105,233 @@ func initTemplates() {
 			return s
 		},
 	}
-	templates = template.Must(template.New("t").Funcs(funcMap).Parse(homeTemplate + bucketTemplate + editTemplate))
+	templates = template.Must(template.New("t").Funcs(funcMap).Parse(
+		loginTemplate + homeTemplate + bucketTemplate + editTemplate + resetPasswordTemplate + exportTemplate,
+	))
 }
+
+// authMiddleware protects routes that require authentication.
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cookie, err := r.Cookie(sessionCookieName)
+		if err != nil || cookie.Value == "" || !isValidSession(cookie.Value) {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		next.ServeHTTP(w, r)
+	}
+}
+
+// isValidSession checks if a session token is valid.
+func isValidSession(token string) bool {
+	sessionMutex.Lock()
+	defer sessionMutex.Unlock()
+	_, ok := sessions[token]
+	return ok
+}
+
+// generateSessionToken creates a random session token.
+func generateSessionToken() (string, error) {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes), nil
+}
+
+// loginHandler renders and processes the login form.
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		templates.ExecuteTemplate(w, "login", nil)
+		return
+	}
+
+	// Process POST login
+	username := r.FormValue("username")
+	password := r.FormValue("password")
+	if username == "" || password == "" {
+		http.Error(w, "Username and password required", http.StatusBadRequest)
+		return
+	}
+
+	// Validate credentials from BoltDB "users" bucket.
+	var storedHash []byte
+	err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("users"))
+		if b == nil {
+			return fmt.Errorf("users bucket not found")
+		}
+		storedHash = b.Get([]byte(username))
+		if storedHash == nil {
+			return fmt.Errorf("invalid credentials")
+		}
+		return nil
+	})
+	if err != nil {
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+	// Compare provided password with stored hash.
+	if err = bcrypt.CompareHashAndPassword(storedHash, []byte(password)); err != nil {
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	// Credentials valid, generate session token.
+	token, err := generateSessionToken()
+	if err != nil {
+		http.Error(w, "Failed to generate session token", http.StatusInternalServerError)
+		return
+	}
+	sessionMutex.Lock()
+	sessions[token] = username
+	sessionMutex.Unlock()
+
+	// Set secure session cookie.
+	cookie := http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		HttpOnly: true,
+		// Secure: true, // Uncomment when using HTTPS.
+		Path: "/",
+	}
+	http.SetCookie(w, &cookie)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// logoutHandler clears the session.
+func logoutHandler(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err == nil {
+		sessionMutex.Lock()
+		delete(sessions, cookie.Value)
+		sessionMutex.Unlock()
+		// Clear the cookie.
+		http.SetCookie(w, &http.Cookie{
+			Name:   sessionCookieName,
+			Value:  "",
+			Path:   "/",
+			MaxAge: -1,
+		})
+	}
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+// resetPasswordHandler allows an authenticated user to change their password.
+func resetPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		templates.ExecuteTemplate(w, "reset", nil)
+		return
+	}
+
+	// Process POST reset.
+	username := getUsernameFromSession(r)
+	oldPassword := r.FormValue("old_password")
+	newPassword := r.FormValue("new_password")
+	confirmPassword := r.FormValue("confirm_password")
+
+	if newPassword == "" || newPassword != confirmPassword {
+		http.Error(w, "Passwords do not match or are empty", http.StatusBadRequest)
+		return
+	}
+
+	// Validate old password.
+	var storedHash []byte
+	err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("users"))
+		if b == nil {
+			return fmt.Errorf("users bucket not found")
+		}
+		storedHash = b.Get([]byte(username))
+		if storedHash == nil {
+			return fmt.Errorf("user not found")
+		}
+		return nil
+	})
+	if err != nil {
+		http.Error(w, "User not found", http.StatusInternalServerError)
+		return
+	}
+
+	if err = bcrypt.CompareHashAndPassword(storedHash, []byte(oldPassword)); err != nil {
+		http.Error(w, "Old password incorrect", http.StatusUnauthorized)
+		return
+	}
+
+	// Hash new password and store it.
+	newHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		http.Error(w, "Error hashing new password", http.StatusInternalServerError)
+		return
+	}
+	err = db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("users"))
+		if b == nil {
+			return fmt.Errorf("users bucket not found")
+		}
+		return b.Put([]byte(username), newHash)
+	})
+	if err != nil {
+		http.Error(w, "Failed to update password", http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// exportHandler provides options to export the database.
+func exportHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		templates.ExecuteTemplate(w, "export", nil)
+		return
+	}
+	// Process export request.
+	exportType := r.FormValue("type")
+	if exportType == "json" {
+		exportDBAsJSON(w, r)
+		return
+	} else if exportType == "db" {
+		// Serve the raw .db file.
+		http.ServeFile(w, r, dbPath)
+		return
+	}
+	http.Error(w, "Unknown export type", http.StatusBadRequest)
+}
+
+// exportDBAsJSON exports all buckets and key–value pairs as JSON.
+func exportDBAsJSON(w http.ResponseWriter, r *http.Request) {
+	exportData := make(map[string]map[string]string)
+	err := db.View(func(tx *bolt.Tx) error {
+		return tx.ForEach(func(bucketName []byte, b *bolt.Bucket) error {
+			bucketData := make(map[string]string)
+			c := b.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				bucketData[string(k)] = string(v)
+			}
+			exportData[string(bucketName)] = bucketData
+			return nil
+		})
+	})
+	if err != nil {
+		http.Error(w, "Error exporting DB: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(exportData)
+}
+
+// getUsernameFromSession retrieves the username associated with the session.
+func getUsernameFromSession(r *http.Request) string {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return ""
+	}
+	sessionMutex.Lock()
+	defer sessionMutex.Unlock()
+	return sessions[cookie.Value]
+}
+
+// --- Existing Handlers ---
 
 // homeHandler lists all buckets with pagination.
 func homeHandler(w http.ResponseWriter, r *http.Request) {
@@ -76,6 +340,10 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 	var buckets []string
 	err := db.View(func(tx *bolt.Tx) error {
 		return tx.ForEach(func(name []byte, _ *bolt.Bucket) error {
+			// Exclude internal buckets such as "users"
+			if string(name) == "users" {
+				return nil
+			}
 			buckets = append(buckets, string(name))
 			return nil
 		})
@@ -269,7 +537,7 @@ func contains(haystack, needle string) bool {
 	return strings.Contains(haystack, needle)
 }
 
-// (Optional) API endpoint to get raw JSON of buckets (unchanged from your original code)
+// (Optional) API endpoint to get raw JSON of buckets.
 func apiBucketsHandler(w http.ResponseWriter, r *http.Request) {
 	var buckets []string
 	err := db.View(func(tx *bolt.Tx) error {
@@ -290,6 +558,36 @@ func apiBucketsHandler(w http.ResponseWriter, r *http.Request) {
 // Embedded HTML Templates
 //
 
+// loginTemplate renders the login form.
+const loginTemplate = `
+{{define "login"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>BoltDB Viewer - Login</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+</head>
+<body>
+<div class="container my-4">
+  <h1>Login</h1>
+  <form method="post" action="/login">
+    <div class="mb-3">
+      <label class="form-label">Username</label>
+      <input type="text" class="form-control" name="username" required>
+    </div>
+    <div class="mb-3">
+      <label class="form-label">Password</label>
+      <input type="password" class="form-control" name="password" required>
+    </div>
+    <button type="submit" class="btn btn-primary">Login</button>
+  </form>
+</div>
+</body>
+</html>
+{{end}}
+`
+
 // homeTemplate renders the list of buckets with pagination.
 const homeTemplate = `
 {{define "home"}}
@@ -302,7 +600,14 @@ const homeTemplate = `
 </head>
 <body>
 <div class="container my-4">
-  <h1 class="mb-4">BoltDB Buckets</h1>
+  <div class="d-flex justify-content-between">
+    <h1>BoltDB Buckets</h1>
+    <div>
+      <a class="btn btn-secondary" href="/export">Export DB</a>
+      <a class="btn btn-secondary" href="/reset-password">Reset Password</a>
+      <a class="btn btn-secondary" href="/logout">Logout</a>
+    </div>
+  </div>
   <table class="table table-bordered table-hover">
     <thead class="table-light">
       <tr>
@@ -357,7 +662,14 @@ const bucketTemplate = `
 </head>
 <body>
 <div class="container my-4">
-  <h1 class="mb-4">Bucket: {{.BucketName}}</h1>
+  <div class="d-flex justify-content-between">
+    <h1>Bucket: {{.BucketName}}</h1>
+    <div>
+      <a class="btn btn-secondary" href="/export">Export DB</a>
+      <a class="btn btn-secondary" href="/reset-password">Reset Password</a>
+      <a class="btn btn-secondary" href="/logout">Logout</a>
+    </div>
+  </div>
   <form class="row g-3 mb-4" method="get" action="/bucket">
     <input type="hidden" name="name" value="{{.BucketName}}">
     <div class="col-auto">
@@ -444,6 +756,71 @@ const editTemplate = `
     </div>
     <button type="submit" class="btn btn-primary">Save Changes</button>
     <a class="btn btn-secondary" href="/bucket?name={{.Bucket}}">Cancel</a>
+  </form>
+</div>
+</body>
+</html>
+{{end}}
+`
+
+// resetPasswordTemplate renders the password reset form.
+const resetPasswordTemplate = `
+{{define "reset"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Reset Password</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+</head>
+<body>
+<div class="container my-4">
+  <h1>Reset Password</h1>
+  <form method="post" action="/reset-password">
+    <div class="mb-3">
+      <label class="form-label">Old Password</label>
+      <input type="password" class="form-control" name="old_password" required>
+    </div>
+    <div class="mb-3">
+      <label class="form-label">New Password</label>
+      <input type="password" class="form-control" name="new_password" required>
+    </div>
+    <div class="mb-3">
+      <label class="form-label">Confirm New Password</label>
+      <input type="password" class="form-control" name="confirm_password" required>
+    </div>
+    <button type="submit" class="btn btn-primary">Change Password</button>
+    <a class="btn btn-secondary" href="/">Cancel</a>
+  </form>
+</div>
+</body>
+</html>
+{{end}}
+`
+
+// exportTemplate renders the export options form.
+const exportTemplate = `
+{{define "export"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Export Database</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+</head>
+<body>
+<div class="container my-4">
+  <h1>Export Database</h1>
+  <form method="post" action="/export">
+    <div class="mb-3">
+      <label class="form-label">Choose Export Type</label>
+      <select class="form-select" name="type">
+        <option value="json">JSON</option>
+        <option value="db">Raw .db File</option>
+      </select>
+    </div>
+    <button type="submit" class="btn btn-primary">Export</button>
+    <a class="btn btn-secondary" href="/">Cancel</a>
   </form>
 </div>
 </body>
