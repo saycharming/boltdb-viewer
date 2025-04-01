@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/crypto/bcrypt"
@@ -22,10 +23,10 @@ var (
 	db             *bolt.DB
 	templates      *template.Template
 	bucketsPerPage = 10
-	recordsPerPage = 20
+	recordsPerPage = 10 // Show 10 records per page
 	dbPath         string
 
-	// sessions stores session_token => username mapping (in-memory).
+	// sessions stores session_token => username mapping (in-memory)
 	sessions     = make(map[string]string)
 	sessionMutex sync.Mutex
 )
@@ -33,16 +34,16 @@ var (
 const sessionCookieName = "session_token"
 
 func main() {
-	// Get the user's home directory
+	// Get the user's home directory.
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		log.Fatalf("Failed to get home directory: %v", err)
 	}
-	// Construct the full path to your BoltDB file
-	dbPath = filepath.Join(homeDir, ".path", "db.db")
+	// Construct the full path to your BoltDB file.
+	dbPath = filepath.Join(homeDir, ".fewchoreapi", "db")
 
-	// Open the BoltDB file
-	db, err = bolt.Open(dbPath, 0600, nil)
+	// Open the BoltDB file with a timeout.
+	db, err = bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		log.Fatalf("Failed to open BoltDB file at %s: %v", dbPath, err)
 	}
@@ -70,22 +71,22 @@ func main() {
 		log.Fatalf("Error initializing users: %v", err)
 	}
 
-	// Parse embedded templates
+	// Parse embedded templates.
 	initTemplates()
 
-	// Set up HTTP endpoints (with authentication middleware applied to all protected routes)
+	// Set up HTTP endpoints (with authentication middleware applied to all protected routes).
 	http.HandleFunc("/login", loginHandler)
 	http.HandleFunc("/logout", authMiddleware(logoutHandler))
 	http.HandleFunc("/reset-password", authMiddleware(resetPasswordHandler))
 	http.HandleFunc("/export", authMiddleware(exportHandler))
 
-	// Protected endpoints:
+	// Protected endpoints.
 	http.HandleFunc("/", authMiddleware(homeHandler))
 	http.HandleFunc("/bucket", authMiddleware(bucketHandler))
 	http.HandleFunc("/bucket/edit", authMiddleware(bucketEditHandler))
 	http.HandleFunc("/bucket/delete", authMiddleware(bucketDeleteHandler))
 
-	// Serve static files (if needed, e.g., custom CSS or JS)
+	// Serve static files (if needed, e.g., custom CSS or JS).
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
 
 	fmt.Println("BoltDB viewer running on :8081")
@@ -146,7 +147,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Process POST login
+	// Process POST login.
 	username := r.FormValue("username")
 	password := r.FormValue("password")
 	if username == "" || password == "" {
@@ -331,8 +332,6 @@ func getUsernameFromSession(r *http.Request) string {
 	return sessions[cookie.Value]
 }
 
-// --- Existing Handlers ---
-
 // homeHandler lists all buckets with pagination.
 func homeHandler(w http.ResponseWriter, r *http.Request) {
 	page := getPageParam(r, "page")
@@ -368,7 +367,7 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 	templates.ExecuteTemplate(w, "home", data)
 }
 
-// bucketHandler shows records for a given bucket, with search and pagination.
+// bucketHandler shows records for a given bucket with search and pagination.
 func bucketHandler(w http.ResponseWriter, r *http.Request) {
 	bucketName := r.URL.Query().Get("name")
 	if bucketName == "" {
@@ -387,15 +386,15 @@ func bucketHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		c := b.Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
-			// If a search query is provided, filter records
+			// If a search query is provided, filter records.
 			if searchQuery != "" && !contains(string(k), searchQuery) && !contains(string(v), searchQuery) {
 				continue
 			}
 			totalRecords++
-			// Only include records for the current page
+			// Only include records for the current page.
 			if totalRecords > (page-1)*recordsPerPage && totalRecords <= page*recordsPerPage {
 				records = append(records, map[string]string{
-					"key":   string(k),
+					"key":   hex.EncodeToString(k), // display key as hex
 					"value": string(v),
 				})
 			}
@@ -423,25 +422,29 @@ func bucketHandler(w http.ResponseWriter, r *http.Request) {
 	templates.ExecuteTemplate(w, "bucket", data)
 }
 
-// bucketEditHandler handles both showing the edit form (GET) and processing the update (POST).
+// bucketEditHandler handles showing the edit form (GET) and processing the update (POST).
 func bucketEditHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		// Show edit form
 		bucketName := r.URL.Query().Get("bucket")
-		key := r.URL.Query().Get("key")
-		if bucketName == "" || key == "" {
+		keyHex := r.URL.Query().Get("key")
+		if bucketName == "" || keyHex == "" {
 			http.Error(w, "Bucket name and key are required", http.StatusBadRequest)
 			return
 		}
+		decodedKey, err := hex.DecodeString(keyHex)
+		if err != nil {
+			http.Error(w, "Invalid key format", http.StatusBadRequest)
+			return
+		}
 		var value string
-		err := db.View(func(tx *bolt.Tx) error {
+		err = db.View(func(tx *bolt.Tx) error {
 			b := tx.Bucket([]byte(bucketName))
 			if b == nil {
 				return fmt.Errorf("bucket %s not found", bucketName)
 			}
-			v := b.Get([]byte(key))
+			v := b.Get(decodedKey)
 			if v == nil {
-				return fmt.Errorf("key %s not found in bucket %s", key, bucketName)
+				return fmt.Errorf("key %s not found in bucket %s", keyHex, bucketName)
 			}
 			value = string(v)
 			return nil
@@ -456,25 +459,29 @@ func bucketEditHandler(w http.ResponseWriter, r *http.Request) {
 			Value  string
 		}{
 			Bucket: bucketName,
-			Key:    key,
+			Key:    keyHex,
 			Value:  value,
 		}
 		templates.ExecuteTemplate(w, "edit", data)
 	} else if r.Method == http.MethodPost {
-		// Process edit
 		bucketName := r.FormValue("bucket")
-		key := r.FormValue("key")
+		keyHex := r.FormValue("key")
 		newValue := r.FormValue("value")
-		if bucketName == "" || key == "" {
+		if bucketName == "" || keyHex == "" {
 			http.Error(w, "Bucket name and key are required", http.StatusBadRequest)
 			return
 		}
-		err := db.Update(func(tx *bolt.Tx) error {
+		decodedKey, err := hex.DecodeString(keyHex)
+		if err != nil {
+			http.Error(w, "Invalid key format", http.StatusBadRequest)
+			return
+		}
+		err = db.Update(func(tx *bolt.Tx) error {
 			b := tx.Bucket([]byte(bucketName))
 			if b == nil {
 				return fmt.Errorf("bucket %s not found", bucketName)
 			}
-			return b.Put([]byte(key), []byte(newValue))
+			return b.Put(decodedKey, []byte(newValue))
 		})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -491,17 +498,22 @@ func bucketDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	bucketName := r.FormValue("bucket")
-	key := r.FormValue("key")
-	if bucketName == "" || key == "" {
+	keyHex := r.FormValue("key")
+	if bucketName == "" || keyHex == "" {
 		http.Error(w, "Bucket name and key are required", http.StatusBadRequest)
 		return
 	}
-	err := db.Update(func(tx *bolt.Tx) error {
+	decodedKey, err := hex.DecodeString(keyHex)
+	if err != nil {
+		http.Error(w, "Invalid key format", http.StatusBadRequest)
+		return
+	}
+	err = db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(bucketName))
 		if b == nil {
 			return fmt.Errorf("bucket %s not found", bucketName)
 		}
-		return b.Delete([]byte(key))
+		return b.Delete(decodedKey)
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -510,7 +522,7 @@ func bucketDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, fmt.Sprintf("/bucket?name=%s", bucketName), http.StatusSeeOther)
 }
 
-// Helper: getPageParam returns the page number from the URL query (default is 1)
+// getPageParam returns the page number from the URL query (default is 1).
 func getPageParam(r *http.Request, param string) int {
 	page := 1
 	if p, err := strconv.Atoi(r.URL.Query().Get(param)); err == nil && p > 0 {
@@ -519,7 +531,7 @@ func getPageParam(r *http.Request, param string) int {
 	return page
 }
 
-// Helper: paginate returns the start and end indices for slicing.
+// paginate returns the start and end indices for slicing.
 func paginate(total, page, perPage int) (int, int) {
 	start := (page - 1) * perPage
 	end := start + perPage
@@ -532,7 +544,7 @@ func paginate(total, page, perPage int) (int, int) {
 	return start, end
 }
 
-// Helper: contains checks if needle is in haystack (case-sensitive).
+// contains checks if needle is in haystack (case-sensitive).
 func contains(haystack, needle string) bool {
 	return strings.Contains(haystack, needle)
 }
@@ -558,7 +570,6 @@ func apiBucketsHandler(w http.ResponseWriter, r *http.Request) {
 // Embedded HTML Templates
 //
 
-// loginTemplate renders the login form.
 const loginTemplate = `
 {{define "login"}}
 <!DOCTYPE html>
@@ -588,7 +599,6 @@ const loginTemplate = `
 {{end}}
 `
 
-// homeTemplate renders the list of buckets with pagination.
 const homeTemplate = `
 {{define "home"}}
 <!DOCTYPE html>
@@ -616,15 +626,14 @@ const homeTemplate = `
       </tr>
     </thead>
     <tbody>
-    {{range .Buckets}}
+      {{range .Buckets}}
       <tr>
         <td>{{.}}</td>
         <td><a class="btn btn-sm btn-primary" href="/bucket?name={{.}}">Browse</a></td>
       </tr>
-    {{end}}
+      {{end}}
     </tbody>
   </table>
-  <!-- Pagination controls -->
   <nav>
     <ul class="pagination">
       {{if gt .CurrentPage 1}}
@@ -650,7 +659,6 @@ const homeTemplate = `
 {{end}}
 `
 
-// bucketTemplate renders records within a bucket, with search and pagination.
 const bucketTemplate = `
 {{define "bucket"}}
 <!DOCTYPE html>
@@ -682,13 +690,13 @@ const bucketTemplate = `
   <table class="table table-bordered table-hover">
     <thead class="table-light">
       <tr>
-        <th>Key</th>
+        <th>Key (hex)</th>
         <th>Value</th>
         <th>Actions</th>
       </tr>
     </thead>
     <tbody>
-    {{range .Records}}
+      {{range .Records}}
       <tr>
         <td>{{.key}}</td>
         <td>{{.value}}</td>
@@ -701,10 +709,9 @@ const bucketTemplate = `
           </form>
         </td>
       </tr>
-    {{end}}
+      {{end}}
     </tbody>
   </table>
-  <!-- Pagination controls -->
   <nav>
     <ul class="pagination">
       {{if gt .CurrentPage 1}}
@@ -731,7 +738,6 @@ const bucketTemplate = `
 {{end}}
 `
 
-// editTemplate renders the form for editing a key-value pair.
 const editTemplate = `
 {{define "edit"}}
 <!DOCTYPE html>
@@ -747,7 +753,7 @@ const editTemplate = `
   <form method="post" action="/bucket/edit">
     <input type="hidden" name="bucket" value="{{.Bucket}}">
     <div class="mb-3">
-      <label class="form-label">Key</label>
+      <label class="form-label">Key (hex)</label>
       <input type="text" class="form-control" name="key" value="{{.Key}}" readonly>
     </div>
     <div class="mb-3">
@@ -763,7 +769,6 @@ const editTemplate = `
 {{end}}
 `
 
-// resetPasswordTemplate renders the password reset form.
 const resetPasswordTemplate = `
 {{define "reset"}}
 <!DOCTYPE html>
@@ -798,7 +803,6 @@ const resetPasswordTemplate = `
 {{end}}
 `
 
-// exportTemplate renders the export options form.
 const exportTemplate = `
 {{define "export"}}
 <!DOCTYPE html>
@@ -827,21 +831,3 @@ const exportTemplate = `
 </html>
 {{end}}
 `
-
-// Template Functions: To support simple arithmetic in pagination templates.
-func init() {
-	// Add simple arithmetic template functions.
-	funcMap := template.FuncMap{
-		"add": func(a, b int) int { return a + b },
-		"sub": func(a, b int) int { return a - b },
-		// until returns a slice from 0 to n-1 for looping.
-		"until": func(count int) []int {
-			s := make([]int, count)
-			for i := 0; i < count; i++ {
-				s[i] = i
-			}
-			return s
-		},
-	}
-	templates = template.New("t").Funcs(funcMap)
-}
